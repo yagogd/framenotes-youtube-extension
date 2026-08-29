@@ -28,6 +28,12 @@
   "content_scripts": [
     {
       "matches": ["https://www.youtube.com/*"],
+      "js": ["src/injected/timedtext-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://www.youtube.com/*"],
       "css": ["src/ui/transcript/transcript.css"],
       "js": [
         "src/utils/i18n.js",

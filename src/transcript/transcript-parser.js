@@ -202,6 +202,57 @@
     return { cues, blocks: groupCuesIntoBlocks(cues, options) };
   }
 
+  function decodeXmlText(value) {
+    const entities = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+    const codePoint = (value, radix) => {
+      const parsed = parseInt(value, radix);
+      return Number.isInteger(parsed) && parsed >= 0 && parsed <= 0x10ffff ? String.fromCodePoint(parsed) : "";
+    };
+    return normalizeText(String(value || "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&#x([0-9a-f]+);/gi, (_, code) => codePoint(code, 16))
+      .replace(/&#(\d+);/g, (_, code) => codePoint(code, 10))
+      .replace(/&(amp|lt|gt|quot|apos);/g, (_, name) => entities[name]));
+  }
+
+  function xmlAttribute(attributes, name) {
+    const match = String(attributes || "").match(new RegExp(`(?:^|\\s)${name}=(?:"([^"]*)"|'([^']*)')`, "i"));
+    return match ? match[1] ?? match[2] : null;
+  }
+
+  function parseTimedTextXml(text, options) {
+    const events = [];
+    const source = String(text || "");
+    const textNodes = source.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi);
+    for (const match of textNodes) {
+      const startMs = Math.round((Number(xmlAttribute(match[1], "start")) || 0) * 1000);
+      const durationMs = Math.round((Number(xmlAttribute(match[1], "dur")) || 0) * 1000);
+      const cueText = decodeXmlText(match[2]);
+      if (cueText) events.push({ tStartMs: startMs, dDurationMs: durationMs, segs: [{ utf8: cueText }] });
+    }
+
+    if (!events.length) {
+      const paragraphs = source.matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi);
+      for (const match of paragraphs) {
+        const startMs = Number(xmlAttribute(match[1], "t")) || 0;
+        const durationMs = Number(xmlAttribute(match[1], "d")) || 0;
+        const cueText = decodeXmlText(match[2]);
+        if (cueText) events.push({ tStartMs: startMs, dDurationMs: durationMs, segs: [{ utf8: cueText }] });
+      }
+    }
+
+    return parseJson3({ events }, options);
+  }
+
+  function parseTimedText(text, options) {
+    const source = String(text || "").trim();
+    if (!source) return { cues: [], blocks: [] };
+    if (source.startsWith("{")) return parseJson3(JSON.parse(source), options);
+    if (source.startsWith("<")) return parseTimedTextXml(source, options);
+    throw new Error("Formato de subtítulos no reconocido");
+  }
+
   return {
     DEFAULT_GROUPING_OPTIONS,
     normalizeText,
@@ -211,5 +262,7 @@
     originalCuesAsBlocks,
     blocksForMode,
     parseJson3,
+    parseTimedTextXml,
+    parseTimedText,
   };
 });

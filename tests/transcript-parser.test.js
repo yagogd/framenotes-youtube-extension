@@ -4,6 +4,7 @@ const {
   normalizeJson3Events,
   groupCuesIntoBlocks,
   blocksForMode,
+  parseTimedText,
 } = require("../src/transcript/transcript-parser.js");
 
 function cue(startMs, endMs, text) {
@@ -174,4 +175,14 @@ test("fusiona duplicados progresivos evidentes sin perder el intervalo", () => {
     ],
   });
   assert.deepEqual(result, [cue(100, 1500, "Hola mundo")]);
+});
+
+test("parsea timedtext XML clásico sin una segunda descarga", () => {
+  const result = parseTimedText('<transcript><text start="1.25" dur="2.5">Hola &amp; mundo</text></transcript>');
+  assert.deepEqual(result.cues, [cue(1250, 3750, "Hola & mundo")]);
+});
+
+test("parsea timedtext srv3 con tiempos en milisegundos", () => {
+  const result = parseTimedText('<timedtext format="3"><body><p t="320" d="1800"><s>Texto </s><s>capturado</s></p></body></timedtext>');
+  assert.deepEqual(result.cues, [cue(320, 2120, "Texto capturado")]);
 });

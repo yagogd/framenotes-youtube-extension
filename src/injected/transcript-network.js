@@ -22,6 +22,11 @@
   let ignorePlayerCaptionRequestsUntil = 0;
   let requestInFlight = false;
   const observedPlayerUrls = new Map();
+  const capturedTimedTextBodies = new Map();
+  const pendingObservedFallbacks = new Set();
+  const CAPTURE_EVENT = "ytx-timedtext-captured";
+  const MAX_CAPTURED_BODIES = 8;
+  let activeRequestedTrack = null;
 
   function schedule(callback, delay) {
     const timer = setTimeout(() => {
@@ -74,10 +79,10 @@
       const previousTrack = player.getOption?.("captions", "track") || null;
       const sourceCode = track.sourceLanguageCode || track.languageCode;
       const sourceTrack = playerCaptionTracks().find((candidate) => candidate.languageCode === sourceCode &&
-        (track.isTranslated || (candidate.kind === "asr") === Boolean(track.isAutomatic))) ||
+        (candidate.kind === "asr") === Boolean(track.isTranslated ? track.sourceIsAutomatic : track.isAutomatic)) ||
         playerCaptionTracks().find((candidate) => candidate.languageCode === sourceCode);
       const requestedTrack = sourceTrack ? { ...sourceTrack } : { languageCode: sourceCode };
-      if (track.isTranslated) {
+    if (track.isTranslated) {
         requestedTrack.translationLanguage = playerTranslationLanguages()
           .find((language) => language.languageCode === track.languageCode) || { languageCode: track.languageCode };
       }
@@ -99,8 +104,15 @@
     const parsed = new URL(url);
     const translated = parsed.searchParams.get("tlang");
     const language = parsed.searchParams.get("lang") || "";
-    if (track.isTranslated) return translated === track.languageCode;
-    return !translated && (language === track.languageCode || language.startsWith(`${track.languageCode}-`) ||
+      if (track.isTranslated) {
+      const source = track.sourceLanguageCode || "";
+      const sourceIsAutomatic = parsed.searchParams.get("kind") === "asr";
+      return translated === track.languageCode && sourceIsAutomatic === Boolean(track.sourceIsAutomatic) &&
+        (!source || language === source || language.startsWith(`${source}-`));
+    }
+    const automatic = parsed.searchParams.get("kind") === "asr";
+    return !translated && automatic === Boolean(track.isAutomatic) &&
+      (language === track.languageCode || language.startsWith(`${track.languageCode}-`) ||
       track.languageCode.startsWith(`${language}-`));
   }
 
@@ -160,6 +172,7 @@
           isAutomatic: true,
           isTranslated: true,
           sourceLanguageCode: translationSource.languageCode,
+          sourceIsAutomatic: Boolean(translationSource.isAutomatic),
           baseUrl: url.href,
         };
       }) : [];
@@ -232,6 +245,50 @@
     return { languageCode, languageName, isAutomatic, isTranslated };
   }
 
+  function completeTimedTextBody(url, text, options = {}) {
+    const {
+      selectedTrackId = null,
+      generation = requestGeneration,
+      videoIdAtDetection = currentVideoId,
+      abortActiveFetch = false,
+    } = options;
+    if (!text.trim()) {
+      lastFailureKind = "empty";
+      throw new Error("YouTube devolvió una respuesta vacía para esta pista");
+    }
+    if (!window.YTXTranscriptParser) throw new Error("El parser de transcripción no está disponible");
+    const parser = window.YTXTranscriptParser;
+    const { cues, blocks } = parser.parseTimedText
+      ? parser.parseTimedText(text)
+      : parser.parseJson3(JSON.parse(text));
+    if (!cues.length) throw new Error("La transcripción extraída está vacía");
+    if (videoIdAtDetection !== currentVideoId || generation !== requestGeneration) return false;
+
+    if (abortActiveFetch) {
+      activeFetchController?.abort();
+      activeFetchController = null;
+    }
+    transcriptCompleted = true;
+    if (!availableTracks.length) collectTracks();
+    const trackInformation = getTrackInformation(url);
+    lastReadyPayload = {
+      type: "YT_TRANSCRIPT_READY",
+      videoId: currentVideoId,
+      cues,
+      blocks,
+      ...trackInformation,
+      selectedTrackId: selectedTrackId || availableTracks.find((track) =>
+        track.languageCode === trackInformation.languageCode && track.isAutomatic === trackInformation.isAutomatic
+      )?.id || null,
+      tracks: availableTracks.map(({ baseUrl, ...track }) => track),
+    };
+    const key = cacheKey(currentVideoId, lastReadyPayload.selectedTrackId);
+    if (key) transcriptCache.set(key, lastReadyPayload);
+    post(lastReadyPayload);
+    window.dispatchEvent(new Event("ytx-transcript-ready-internal"));
+    return true;
+  }
+
   async function processTimedTextUrl(url, options = {}) {
     const { force = false, selectedTrackId = null, generation = requestGeneration, silentFailure = false, ignoreRateLimit = false } = options;
     if (!enabled || (!force && processedUrls.has(url)) || (!force && transcriptCompleted)) return false;
@@ -270,35 +327,7 @@
         lastFailureKind = "http";
         throw new Error(`HTTP ${response.status}`);
       }
-      if (!text.trim()) {
-        lastFailureKind = "empty";
-        throw new Error("YouTube devolvió una respuesta vacía para esta pista");
-      }
-      if (!text.trimStart().startsWith("{")) throw new Error("La respuesta no parece JSON");
-
-      if (!window.YTXTranscriptParser) throw new Error("El parser de transcripción no está disponible");
-      const { cues, blocks } = window.YTXTranscriptParser.parseJson3(JSON.parse(text));
-      if (!cues.length) throw new Error("La transcripción extraída está vacía");
-      if (videoIdAtDetection !== currentVideoId || generation !== requestGeneration) return false;
-
-      transcriptCompleted = true;
-      if (!availableTracks.length) collectTracks();
-      lastReadyPayload = {
-        type: "YT_TRANSCRIPT_READY",
-        videoId: currentVideoId,
-        cues,
-        blocks,
-        ...getTrackInformation(url),
-        selectedTrackId: selectedTrackId || availableTracks.find((track) => {
-          const info = getTrackInformation(url);
-          return track.languageCode === info.languageCode && track.isAutomatic === info.isAutomatic;
-        })?.id || null,
-        tracks: availableTracks.map(({ baseUrl, ...track }) => track),
-      };
-      const key = cacheKey(currentVideoId, lastReadyPayload.selectedTrackId);
-      if (key) transcriptCache.set(key, lastReadyPayload);
-      post(lastReadyPayload);
-      return true;
+      return completeTimedTextBody(url, text, { selectedTrackId, generation, videoIdAtDetection });
     } catch (error) {
       if (error?.name === "AbortError" || generation !== requestGeneration) return false;
       if (!silentFailure) console.error("[Transcript] Error:", error);
@@ -310,6 +339,121 @@
       if (activeFetchController === controller) activeFetchController = null;
     }
   }
+
+  function timedTextVideoId(url) {
+    try { return new URL(url).searchParams.get("v"); } catch (_) { return null; }
+  }
+
+  function capturedBodyMatchesPreference(entry) {
+    if (!entry || timedTextVideoId(entry.url) !== currentVideoId) return false;
+    const selected = preferredTrack(availableTracks);
+    return Boolean(selected && captionUrlMatchesTrack(entry.url, selected));
+  }
+
+  function rememberCapturedTimedText(entry) {
+    if (!entry || typeof entry.url !== "string" || typeof entry.body !== "string") return;
+    if (!entry.body && Number(entry.status) !== 429) return;
+    if (!entry.url.includes("/api/timedtext")) return;
+    const normalized = {
+      url: entry.url,
+      body: entry.body,
+      status: Number(entry.status) || 0,
+      contentType: entry.contentType || "",
+      retryAfter: entry.retryAfter || "",
+      capturedAt: Number(entry.capturedAt) || Date.now(),
+    };
+    capturedTimedTextBodies.delete(normalized.url);
+    capturedTimedTextBodies.set(normalized.url, normalized);
+    while (capturedTimedTextBodies.size > MAX_CAPTURED_BODIES) {
+      capturedTimedTextBodies.delete(capturedTimedTextBodies.keys().next().value);
+    }
+    recordPlayerTimedTextUrl(normalized.url);
+  }
+
+  function processCapturedTimedText(entry, options = {}) {
+    const generation = options.generation ?? requestGeneration;
+    if (!entry || entry.invalid || !enabled || generation !== requestGeneration) return false;
+    if (timedTextVideoId(entry.url) !== currentVideoId) return false;
+    if (entry.status === 429) {
+      const retryAfter = Number(entry.retryAfter);
+      rateLimitedUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30000);
+      lastFailureKind = "rate-limit";
+      const shouldNotify = !transcriptCompleted && (requestInFlight || activeRequestedTrack || captionProbe);
+      if (shouldNotify && !entry.rateLimitNotified) {
+        entry.rateLimitNotified = true;
+        post({
+          type: "YT_TRANSCRIPT_ERROR",
+          message: "YouTube ha limitado temporalmente las peticiones de subtítulos. Espera unos segundos antes de cambiar de idioma.",
+        });
+      }
+      return false;
+    }
+    if (transcriptCompleted) return false;
+    if (entry.status && (entry.status < 200 || entry.status >= 300)) return false;
+    try {
+      lastFailureKind = null;
+      return completeTimedTextBody(entry.url, entry.body, {
+        selectedTrackId: options.selectedTrackId || null,
+        generation,
+        videoIdAtDetection: currentVideoId,
+        abortActiveFetch: true,
+      });
+    } catch (_) {
+      entry.invalid = true;
+      return false;
+    }
+  }
+
+  function findCapturedTimedText(track = null) {
+    const entries = Array.from(capturedTimedTextBodies.values()).reverse();
+    return entries.find((entry) => {
+      if (entry.invalid || timedTextVideoId(entry.url) !== currentVideoId) return false;
+      return track ? captionUrlMatchesTrack(entry.url, track) : capturedBodyMatchesPreference(entry);
+    }) || null;
+  }
+
+  function tryCapturedTimedText(generation, track = null) {
+    const captured = findCapturedTimedText(track);
+    return captured ? processCapturedTimedText(captured, { generation, selectedTrackId: track?.id }) : false;
+  }
+
+  function matchingObservedTimedTextUrl() {
+    const urls = Array.from(observedPlayerUrls.values()).reverse();
+    return urls.find((url) => capturedBodyMatchesPreference({ url })) || null;
+  }
+
+  function pruneTimedTextData(videoId) {
+    for (const [key, url] of observedPlayerUrls) {
+      if (timedTextVideoId(url) !== videoId) observedPlayerUrls.delete(key);
+    }
+    for (const [url] of capturedTimedTextBodies) {
+      if (timedTextVideoId(url) !== videoId) capturedTimedTextBodies.delete(url);
+    }
+  }
+
+  function handleCapturedTimedText(entry) {
+    if (silentObservedUrls.has(entry?.url)) return;
+    rememberCapturedTimedText(entry);
+    if (!enabled || transcriptCompleted) return;
+    if (timedTextVideoId(entry.url) !== currentVideoId) return;
+    const probe = captionProbe;
+    const requestedTrack = probe?.track || activeRequestedTrack;
+    if (requestedTrack) {
+      if (captionUrlMatchesTrack(entry.url, requestedTrack)) {
+        const loaded = processCapturedTimedText(capturedTimedTextBodies.get(entry.url), {
+          generation: probe?.generation ?? requestGeneration,
+          selectedTrackId: requestedTrack.id,
+        });
+        if (probe && loaded && captionProbe === probe) finishCaptionProbe(true);
+      }
+      return;
+    }
+    if (capturedBodyMatchesPreference(entry)) processCapturedTimedText(capturedTimedTextBodies.get(entry.url));
+  }
+
+  window.addEventListener(CAPTURE_EVENT, (event) => handleCapturedTimedText(event.detail));
+  (Array.isArray(window.__ytxTimedTextCaptureBuffer) ? window.__ytxTimedTextCaptureBuffer : [])
+    .forEach((entry) => rememberCapturedTimedText(entry));
 
   function recordPlayerTimedTextUrl(url) {
     try {
@@ -331,15 +475,22 @@
     return null;
   }
 
-  function handleTimedTextResource(name) {
-    if (silentObservedUrls.has(name)) {
-      silentObservedUrls.delete(name);
-      return;
+  function processObservedTimedText(name, probe = null) {
+    const captured = capturedTimedTextBodies.get(name);
+    if (captured) {
+      const loaded = processCapturedTimedText(captured, probe ? {
+        generation: probe.generation,
+        selectedTrackId: probe.track.id,
+      } : {});
+      if (loaded) {
+        if (probe && captionProbe === probe) finishCaptionProbe(true);
+        return;
+      }
+      if (captured.status === 429) {
+        if (probe && captionProbe === probe) finishCaptionProbe(false);
+        return;
+      }
     }
-    recordPlayerTimedTextUrl(name);
-    if (!captionProbe && Date.now() < ignorePlayerCaptionRequestsUntil) return;
-    const probe = captionProbe;
-    if (probe && !captionUrlMatchesTrack(name, probe.track)) return;
     processTimedTextUrl(name, probe ? {
       force: true,
       selectedTrackId: probe.track.id,
@@ -348,6 +499,30 @@
     } : {}).then((loaded) => {
       if (probe && captionProbe === probe) finishCaptionProbe(loaded);
     });
+  }
+
+  function handleTimedTextResource(name) {
+    if (silentObservedUrls.has(name)) {
+      silentObservedUrls.delete(name);
+      return;
+    }
+    recordPlayerTimedTextUrl(name);
+    if (!captionProbe && Date.now() < ignorePlayerCaptionRequestsUntil) return;
+    const probe = captionProbe;
+    const requestedTrack = probe?.track || activeRequestedTrack;
+    if (requestedTrack && !captionUrlMatchesTrack(name, requestedTrack)) return;
+    if (!requestedTrack && !capturedBodyMatchesPreference({ url: name })) return;
+    if (capturedTimedTextBodies.has(name) || !window.__ytxTimedTextCaptureInstalled) {
+      processObservedTimedText(name, probe);
+      return;
+    }
+    if (pendingObservedFallbacks.has(name)) return;
+    pendingObservedFallbacks.add(name);
+    schedule(() => {
+      pendingObservedFallbacks.delete(name);
+      if (!enabled || transcriptCompleted) return;
+      processObservedTimedText(name, probe && captionProbe === probe ? probe : null);
+    }, 100);
   }
 
   const observer = new PerformanceObserver((list) => {
@@ -375,12 +550,14 @@
   function stopBackgroundWork() {
     requestGeneration += 1;
     requestInFlight = false;
+    activeRequestedTrack = null;
     activeFetchController?.abort();
     activeFetchController = null;
     if (captionProbe) finishCaptionProbe(false);
     pendingTimers.forEach((timer) => clearTimeout(timer));
     pendingTimers.clear();
     silentObservedUrls.clear();
+    pendingObservedFallbacks.clear();
     observer.disconnect();
     observerActive = false;
   }
@@ -397,6 +574,7 @@
         player?.removeEventListener?.("onApiChange", tryResolve);
         player?.removeEventListener?.("onReady", tryResolve);
         document.removeEventListener("yt-player-updated", tryResolve);
+        window.removeEventListener("ytx-transcript-ready-internal", tryResolve);
         if (pollTimer) clearTimeout(pollTimer);
       };
 
@@ -414,6 +592,7 @@
       player?.addEventListener?.("onApiChange", tryResolve);
       player?.addEventListener?.("onReady", tryResolve);
       document.addEventListener("yt-player-updated", tryResolve);
+      window.addEventListener("ytx-transcript-ready-internal", tryResolve);
 
       const poll = () => {
         if (settled || !enabled || generation !== requestGeneration) {
@@ -556,48 +735,43 @@
 
   async function loadTrackDirectly(track, generation) {
     let currentTrack = track;
-    const attemptOwn = async () => processTimedTextUrl(json3Url(currentTrack.baseUrl), {
-      force: true, selectedTrackId: currentTrack.id, generation, silentFailure: true,
-    });
-
-    // 1. Reutiliza la URL firmada que YouTube ya pidió (cero peticiones extra).
-    const playerUrl = matchingPlayerTimedTextUrl(currentTrack);
-    if (playerUrl) {
-      const loaded = await processTimedTextUrl(playerUrl, {
+    const triedUrls = new Set();
+    const attemptUrl = async (url) => {
+      if (!url || triedUrls.has(url)) return false;
+      triedUrls.add(url);
+      return processTimedTextUrl(url, {
         force: true, selectedTrackId: currentTrack.id, generation, silentFailure: true,
       });
-      if (loaded) return true;
-      if (lastFailureKind === "rate-limit") return false;
+    };
+
+    // 1. El cuerpo ya descargado por el player no genera ninguna petición adicional.
+    if (tryCapturedTimedText(generation, currentTrack)) return true;
+
+    // 2. Si solo conocemos la URL firmada del player, la reutilizamos antes del baseUrl.
+    const playerUrl = matchingPlayerTimedTextUrl(currentTrack);
+    if (playerUrl) {
+      const loaded = await attemptUrl(playerUrl);
+      if (loaded || lastFailureKind === "rate-limit") return loaded;
     }
 
-    // 2. Petición propia del baseUrl.
-    let loaded = await attemptOwn();
-    if (loaded) return true;
-    if (lastFailureKind === "rate-limit") return false;
+    // 3. Petición propia del baseUrl en JSON3.
+    let loaded = await attemptUrl(json3Url(currentTrack.baseUrl));
+    if (loaded || lastFailureKind === "rate-limit") return loaded;
 
-    // 3. Reintento solo si YouTube renovó la firma (baseUrl distinto).
-    await new Promise((resolve) => schedule(resolve, 1200));
+    // 4. Solo reintenta si la información disponible ya contiene una URL distinta.
     if (!enabled || generation !== requestGeneration) return false;
     const refreshedTracks = collectTracks();
     const refreshedTrack = refreshedTracks.find((candidate) => candidate.id === track.id) ||
       refreshedTracks.find((candidate) => candidate.languageCode === track.languageCode &&
         Boolean(candidate.isTranslated) === Boolean(track.isTranslated));
     if (refreshedTrack) currentTrack = refreshedTrack;
-    const playerUrlAfterWait = matchingPlayerTimedTextUrl(currentTrack);
-    if (playerUrlAfterWait && playerUrlAfterWait !== playerUrl) {
-      loaded = await processTimedTextUrl(playerUrlAfterWait, {
-        force: true, selectedTrackId: currentTrack.id, generation, silentFailure: true,
-      });
-      if (loaded) return true;
-      if (lastFailureKind === "rate-limit") return false;
-    }
-    if (json3Url(currentTrack.baseUrl) !== json3Url(track.baseUrl)) {
-      loaded = await attemptOwn();
-      if (loaded) return true;
-      if (lastFailureKind === "rate-limit") return false;
-    }
+    if (tryCapturedTimedText(generation, currentTrack)) return true;
+    loaded = await attemptUrl(matchingPlayerTimedTextUrl(currentTrack));
+    if (loaded || lastFailureKind === "rate-limit") return loaded;
+    loaded = await attemptUrl(json3Url(currentTrack.baseUrl));
+    if (loaded || lastFailureKind === "rate-limit") return loaded;
 
-    // 4. Fallback: URL firmada vía probe; Innertube como último recurso.
+    // 5. Fallback: URL firmada vía probe; Innertube como último recurso.
     const probed = await requestSignedCaptionUrl(currentTrack, generation);
     if (probed) return true;
     return loadTrackFromTranscriptApi(currentTrack, generation);
@@ -605,7 +779,6 @@
 
   async function requestTranscript(force = false) {
     if (!enabled) return;
-    startObserver();
     const nextVideoId = videoIdFromLocation();
 
     // Reenvía al instante la última transcripción del mismo vídeo (sin red).
@@ -620,25 +793,40 @@
     requestGeneration += 1;
     const generation = requestGeneration;
     requestInFlight = true;
+    activeRequestedTrack = null;
     if (currentVideoId && nextVideoId !== currentVideoId) {
       transcriptCache.clear();
-      observedPlayerUrls.clear();
+      availableTracks = [];
+      pruneTimedTextData(nextVideoId);
     }
     currentVideoId = nextVideoId;
     transcriptCompleted = false;
     processedUrls.clear();
     post({ type: "YT_TRANSCRIPT_LOADING" });
+    startObserver();
 
     // En navegaciones SPA, yt-navigate-finish puede llegar antes de que el reproductor
     // haya sustituido los datos del vídeo anterior. Esperamos la respuesta correcta.
     try {
+      if (tryCapturedTimedText(generation)) return;
+      const observedUrl = matchingObservedTimedTextUrl();
+      const observedLoad = observedUrl
+        ? processTimedTextUrl(observedUrl, { generation, silentFailure: true })
+        : null;
       const tracks = await waitForCurrentVideoTracks(generation);
       if (generation !== requestGeneration || !enabled) return;
+      if (observedLoad && await observedLoad) return;
       if (transcriptCompleted && lastReadyPayload?.videoId === currentVideoId) return;
       const selected = preferredTrack(tracks);
       if (selected) {
         if (restoreCachedTranscript(selected.id)) return;
-        const loaded = await loadTrackDirectly(selected, generation);
+        activeRequestedTrack = selected;
+        let loaded = false;
+        try {
+          loaded = await loadTrackDirectly(selected, generation);
+        } finally {
+          if (generation === requestGeneration) activeRequestedTrack = null;
+        }
         if (loaded) return;
         if (generation !== requestGeneration || lastFailureKind === "rate-limit") return;
         post({ type: "YT_TRANSCRIPT_ERROR", message: "YouTube no devolvió datos para esta pista de subtítulos." });
@@ -662,21 +850,24 @@
     if (event.data.selectTrackId) {
       const selected = availableTracks.find((track) => track.id === event.data.selectTrackId) || collectTracks().find((track) => track.id === event.data.selectTrackId);
       if (enabled && selected) {
+        startObserver();
         requestGeneration += 1;
         const generation = requestGeneration;
         activeFetchController?.abort();
         if (restoreCachedTranscript(selected.id)) return;
         transcriptCompleted = false;
+        activeRequestedTrack = selected;
         post({ type: "YT_TRANSCRIPT_LOADING" });
         loadTrackDirectly(selected, generation).then((loaded) => {
           if (!loaded && generation === requestGeneration && enabled) {
             post({ type: "YT_TRANSCRIPT_ERROR", message: "YouTube no permitió seleccionar esta pista de subtítulos." });
           }
+        }).finally(() => {
+          if (generation === requestGeneration) activeRequestedTrack = null;
         });
       }
       return;
     }
-    startObserver();
     requestTranscript();
   });
 

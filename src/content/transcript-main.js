@@ -7,6 +7,8 @@
 
   const ytx = globalThis.__YTX;
   const state = ytx.state;
+  let initializing = true;
+  const initialStorageChanges = new Map();
 
   function injectPageScript(path) {
     return new Promise((resolve, reject) => {
@@ -20,6 +22,10 @@
 
   function onStorageChanged(changes, area) {
     if (area !== "local") return;
+    if (initializing) {
+      Object.entries(changes).forEach(([key, change]) => initialStorageChanges.set(key, change));
+      return;
+    }
     const relevant = changes.extensionEnabled || changes.transcriptEnabled || changes.transcriptMode ||
       changes.transcriptGrouping || changes.transcriptPreferredLanguage || changes.transcriptAutoOpenNextVideo ||
       changes.transcriptFavoriteLanguages ||
@@ -107,9 +113,7 @@
     chrome.storage.onChanged.addListener(onStorageChanged);
 
     try {
-      await injectPageScript("src/transcript/transcript-parser.js");
-      await injectPageScript("src/injected/transcript-network.js");
-      chrome.storage.local.get({
+      const initialDefaults = {
         transcriptEnabled: true,
         extensionEnabled: true,
         transcriptMode: "full",
@@ -129,38 +133,45 @@
         notesWindowAppearance: { background: "#08080a", text: "#e4e4e7", font: "Inter, Roboto, Arial, sans-serif", fontSize: 13.5, opacity: 0.54 },
         noteEditorAppearance: { background: "#08080a", text: "#e4e4e7", font: "Inter, Roboto, Arial, sans-serif", fontSize: 13.5, opacity: 0.54 },
         noteStartOffset: 3,
-      }, (stored) => {
-        state.settings.enabled = stored.transcriptEnabled;
-        state.settings.extensionEnabled = stored.extensionEnabled;
-        state.settings.mode = stored.transcriptMode;
-        state.settings.grouping = stored.transcriptGrouping;
-        state.settings.preferredLanguage = stored.transcriptPreferredLanguage;
-        state.settings.favoriteLanguages = Array.isArray(stored.transcriptFavoriteLanguages)
-          ? stored.transcriptFavoriteLanguages : ["es", "en"];
-        state.settings.autoOpenNextVideo = stored.transcriptAutoOpenNextVideo;
-        state.settings.rememberLayout = stored.transcriptRememberLayout !== false;
-        state.settings.displayLeadMs = Math.min(10000, Math.max(-10000, Number(stored.transcriptDisplayLeadMs) || 0));
-        state.settings.notesAppearanceMode = stored.notesAppearanceMode === "separate" ? "separate" : "shared";
-        state.settings.noteStartOffset = Math.min(30, Math.max(0, Number(stored.noteStartOffset) || 3));
-        state.notesAppearance = stored.notesAppearance;
-        state.notesWindowAppearance = stored.notesWindowAppearance;
-        state.noteEditorAppearance = stored.noteEditorAppearance;
-        state.appearance = {
-          background: stored.transcriptPanelBackground,
-          text: stored.transcriptPanelTextColor,
-          font: stored.transcriptPanelFont,
-          fontSize: stored.transcriptPanelFontSize,
-          opacity: stored.transcriptPanelOpacity,
-        };
-        if (state.settings.extensionEnabled) {
-          ytx.bridge.start();
-          ytx.navigation.start();
-          ytx.playerControls.start();
-        }
-        if (state.settings.extensionEnabled && ytx.isWatchPage()) ytx.notes.loadCurrent();
-        if (state.settings.extensionEnabled && state.settings.enabled && ytx.isWatchPage()) ytx.panel.ensure();
-        ytx.bridge.sendControl();
+      };
+      const settingsPromise = new Promise((resolve) => chrome.storage.local.get(initialDefaults, resolve));
+      await injectPageScript("src/transcript/transcript-parser.js");
+      await injectPageScript("src/injected/transcript-network.js");
+      const stored = await settingsPromise;
+      initialStorageChanges.forEach((change, key) => {
+        stored[key] = change.newValue === undefined ? initialDefaults[key] : change.newValue;
       });
+      initializing = false;
+      state.settings.enabled = stored.transcriptEnabled;
+      state.settings.extensionEnabled = stored.extensionEnabled;
+      state.settings.mode = stored.transcriptMode;
+      state.settings.grouping = stored.transcriptGrouping;
+      state.settings.preferredLanguage = stored.transcriptPreferredLanguage;
+      state.settings.favoriteLanguages = Array.isArray(stored.transcriptFavoriteLanguages)
+        ? stored.transcriptFavoriteLanguages : ["es", "en"];
+      state.settings.autoOpenNextVideo = stored.transcriptAutoOpenNextVideo;
+      state.settings.rememberLayout = stored.transcriptRememberLayout !== false;
+      state.settings.displayLeadMs = Math.min(10000, Math.max(-10000, Number(stored.transcriptDisplayLeadMs) || 0));
+      state.settings.notesAppearanceMode = stored.notesAppearanceMode === "separate" ? "separate" : "shared";
+      state.settings.noteStartOffset = Math.min(30, Math.max(0, Number(stored.noteStartOffset) || 3));
+      state.notesAppearance = stored.notesAppearance;
+      state.notesWindowAppearance = stored.notesWindowAppearance;
+      state.noteEditorAppearance = stored.noteEditorAppearance;
+      state.appearance = {
+        background: stored.transcriptPanelBackground,
+        text: stored.transcriptPanelTextColor,
+        font: stored.transcriptPanelFont,
+        fontSize: stored.transcriptPanelFontSize,
+        opacity: stored.transcriptPanelOpacity,
+      };
+      if (state.settings.extensionEnabled) {
+        ytx.bridge.start();
+        ytx.navigation.start();
+        ytx.playerControls.start();
+      }
+      if (state.settings.extensionEnabled && ytx.isWatchPage()) ytx.notes.loadCurrent();
+      if (state.settings.extensionEnabled && state.settings.enabled && ytx.isWatchPage()) ytx.panel.ensure();
+      ytx.bridge.sendControl();
     } catch (error) {
       console.error("YouTube Transcript:", error);
       ytx.panel.showMessage("No se pudo cargar", error.message);
