@@ -20,6 +20,8 @@
   const silentObservedUrls = new Set();
   let captionProbe = null;
   let ignorePlayerCaptionRequestsUntil = 0;
+  let requestInFlight = false;
+  const observedPlayerUrls = new Map();
 
   function schedule(callback, delay) {
     const timer = setTimeout(() => {
@@ -309,33 +311,70 @@
     }
   }
 
+  function recordPlayerTimedTextUrl(url) {
+    try {
+      const parsed = new URL(url);
+      const v = parsed.searchParams.get("v") || currentVideoId || "";
+      const lang = parsed.searchParams.get("lang") || "";
+      const tlang = parsed.searchParams.get("tlang") || "";
+      if (v) observedPlayerUrls.set(`${v}:${lang}:${tlang}`, url);
+    } catch (_) { /* URL inválida; se ignora. */ }
+  }
+
+  function matchingPlayerTimedTextUrl(track) {
+    if (!currentVideoId || !track) return null;
+    const prefix = `${currentVideoId}:`;
+    for (const [key, url] of observedPlayerUrls) {
+      if (!key.startsWith(prefix)) continue;
+      if (captionUrlMatchesTrack(url, track)) return url;
+    }
+    return null;
+  }
+
+  function handleTimedTextResource(name) {
+    if (silentObservedUrls.has(name)) {
+      silentObservedUrls.delete(name);
+      return;
+    }
+    recordPlayerTimedTextUrl(name);
+    if (!captionProbe && Date.now() < ignorePlayerCaptionRequestsUntil) return;
+    const probe = captionProbe;
+    if (probe && !captionUrlMatchesTrack(name, probe.track)) return;
+    processTimedTextUrl(name, probe ? {
+      force: true,
+      selectedTrackId: probe.track.id,
+      generation: probe.generation,
+      ignoreRateLimit: true,
+    } : {}).then((loaded) => {
+      if (probe && captionProbe === probe) finishCaptionProbe(loaded);
+    });
+  }
+
   const observer = new PerformanceObserver((list) => {
     for (const entry of list.getEntries()) {
       if (!entry.name.includes("/api/timedtext")) continue;
-      if (silentObservedUrls.delete(entry.name)) continue;
-      if (!captionProbe && Date.now() < ignorePlayerCaptionRequestsUntil) continue;
-      const probe = captionProbe;
-      if (probe && !captionUrlMatchesTrack(entry.name, probe.track)) continue;
-      processTimedTextUrl(entry.name, probe ? {
-        force: true,
-        selectedTrackId: probe.track.id,
-        generation: probe.generation,
-        ignoreRateLimit: true,
-      } : {}).then((loaded) => {
-        if (probe && captionProbe === probe) finishCaptionProbe(loaded);
-      });
+      handleTimedTextResource(entry.name);
     }
   });
+
+  function scanBufferedTimedText() {
+    const entries = performance.getEntriesByType?.("resource") || [];
+    for (const entry of entries) {
+      if (entry.name && entry.name.includes("/api/timedtext")) handleTimedTextResource(entry.name);
+    }
+  }
 
   function startObserver() {
     if (observerActive) return;
     observer.observe(observerStarted ? { type: "resource" } : { type: "resource", buffered: true });
     observerActive = true;
     observerStarted = true;
+    scanBufferedTimedText();
   }
 
   function stopBackgroundWork() {
     requestGeneration += 1;
+    requestInFlight = false;
     activeFetchController?.abort();
     activeFetchController = null;
     if (captionProbe) finishCaptionProbe(false);
@@ -348,13 +387,54 @@
 
   async function waitForCurrentVideoTracks(generation, timeoutMs = 10000) {
     const deadline = Date.now() + timeoutMs;
-    while (enabled && generation === requestGeneration && Date.now() < deadline) {
-      const responseVideoId = playerResponseVideoId();
-      const tracks = playerCaptionTracks();
-      if ((!responseVideoId || responseVideoId === currentVideoId) && tracks.length) return collectTracks();
-      await new Promise((resolve) => schedule(resolve, 250));
-    }
-    return [];
+    const player = document.getElementById("movie_player");
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let pollTimer = null;
+
+      const cleanup = () => {
+        player?.removeEventListener?.("onApiChange", tryResolve);
+        player?.removeEventListener?.("onReady", tryResolve);
+        document.removeEventListener("yt-player-updated", tryResolve);
+        if (pollTimer) clearTimeout(pollTimer);
+      };
+
+      const tryResolve = () => {
+        if (settled || !enabled || generation !== requestGeneration) return;
+        const responseVideoId = playerResponseVideoId();
+        const tracks = playerCaptionTracks();
+        if ((!responseVideoId || responseVideoId === currentVideoId) && tracks.length) {
+          settled = true;
+          cleanup();
+          resolve(collectTracks());
+        }
+      };
+
+      player?.addEventListener?.("onApiChange", tryResolve);
+      player?.addEventListener?.("onReady", tryResolve);
+      document.addEventListener("yt-player-updated", tryResolve);
+
+      const poll = () => {
+        if (settled || !enabled || generation !== requestGeneration) {
+          cleanup();
+          resolve([]);
+          return;
+        }
+        tryResolve();
+        if (!settled) {
+          if (Date.now() >= deadline) {
+            cleanup();
+            resolve([]);
+          } else {
+            pollTimer = schedule(poll, 250);
+          }
+        }
+      };
+
+      tryResolve();
+      pollTimer = schedule(poll, 250);
+    });
   }
 
   function transcriptParams(videoId, languageCode) {
@@ -476,42 +556,74 @@
 
   async function loadTrackDirectly(track, generation) {
     let currentTrack = track;
-    for (const delay of [0, 1200]) {
-      if (delay) await new Promise((resolve) => schedule(resolve, delay));
-      if (!enabled || generation !== requestGeneration) return false;
-      if (delay) {
-        const refreshedTracks = collectTracks();
-        currentTrack = refreshedTracks.find((candidate) => candidate.id === track.id) ||
-          refreshedTracks.find((candidate) => candidate.languageCode === track.languageCode &&
-            Boolean(candidate.isTranslated) === Boolean(track.isTranslated)) || currentTrack;
-      }
-      const loaded = await processTimedTextUrl(json3Url(currentTrack.baseUrl), {
+    const attemptOwn = async () => processTimedTextUrl(json3Url(currentTrack.baseUrl), {
+      force: true, selectedTrackId: currentTrack.id, generation, silentFailure: true,
+    });
+
+    // 1. Reutiliza la URL firmada que YouTube ya pidió (cero peticiones extra).
+    const playerUrl = matchingPlayerTimedTextUrl(currentTrack);
+    if (playerUrl) {
+      const loaded = await processTimedTextUrl(playerUrl, {
         force: true, selectedTrackId: currentTrack.id, generation, silentFailure: true,
       });
       if (loaded) return true;
       if (lastFailureKind === "rate-limit") return false;
     }
-    const apiLoaded = await loadTrackFromTranscriptApi(currentTrack, generation);
-    if (apiLoaded) return true;
-    return requestSignedCaptionUrl(currentTrack, generation);
+
+    // 2. Petición propia del baseUrl.
+    let loaded = await attemptOwn();
+    if (loaded) return true;
+    if (lastFailureKind === "rate-limit") return false;
+
+    // 3. Reintento solo si YouTube renovó la firma (baseUrl distinto).
+    await new Promise((resolve) => schedule(resolve, 1200));
+    if (!enabled || generation !== requestGeneration) return false;
+    const refreshedTracks = collectTracks();
+    const refreshedTrack = refreshedTracks.find((candidate) => candidate.id === track.id) ||
+      refreshedTracks.find((candidate) => candidate.languageCode === track.languageCode &&
+        Boolean(candidate.isTranslated) === Boolean(track.isTranslated));
+    if (refreshedTrack) currentTrack = refreshedTrack;
+    const playerUrlAfterWait = matchingPlayerTimedTextUrl(currentTrack);
+    if (playerUrlAfterWait && playerUrlAfterWait !== playerUrl) {
+      loaded = await processTimedTextUrl(playerUrlAfterWait, {
+        force: true, selectedTrackId: currentTrack.id, generation, silentFailure: true,
+      });
+      if (loaded) return true;
+      if (lastFailureKind === "rate-limit") return false;
+    }
+    if (json3Url(currentTrack.baseUrl) !== json3Url(track.baseUrl)) {
+      loaded = await attemptOwn();
+      if (loaded) return true;
+      if (lastFailureKind === "rate-limit") return false;
+    }
+
+    // 4. Fallback: URL firmada vía probe; Innertube como último recurso.
+    const probed = await requestSignedCaptionUrl(currentTrack, generation);
+    if (probed) return true;
+    return loadTrackFromTranscriptApi(currentTrack, generation);
   }
 
   async function requestTranscript(force = false) {
     if (!enabled) return;
     startObserver();
     const nextVideoId = videoIdFromLocation();
-    if (!force && nextVideoId && nextVideoId === currentVideoId && (transcriptCompleted || activeFetchController)) return;
 
-    if (!force && lastReadyPayload?.videoId === nextVideoId) {
+    // Reenvía al instante la última transcripción del mismo vídeo (sin red).
+    if (!force && nextVideoId && lastReadyPayload?.videoId === nextVideoId) {
       currentVideoId = nextVideoId;
       transcriptCompleted = true;
       post(lastReadyPayload);
       return;
     }
+    if (!force && nextVideoId && nextVideoId === currentVideoId && (transcriptCompleted || activeFetchController || requestInFlight)) return;
 
     requestGeneration += 1;
     const generation = requestGeneration;
-    if (currentVideoId && nextVideoId !== currentVideoId) transcriptCache.clear();
+    requestInFlight = true;
+    if (currentVideoId && nextVideoId !== currentVideoId) {
+      transcriptCache.clear();
+      observedPlayerUrls.clear();
+    }
     currentVideoId = nextVideoId;
     transcriptCompleted = false;
     processedUrls.clear();
@@ -519,19 +631,24 @@
 
     // En navegaciones SPA, yt-navigate-finish puede llegar antes de que el reproductor
     // haya sustituido los datos del vídeo anterior. Esperamos la respuesta correcta.
-    const tracks = await waitForCurrentVideoTracks(generation);
-    if (generation !== requestGeneration || !enabled) return;
-    const selected = preferredTrack(tracks);
-    if (selected) {
-      if (restoreCachedTranscript(selected.id)) return;
-      const loaded = await loadTrackDirectly(selected, generation);
-      if (loaded) return;
-      if (generation !== requestGeneration || lastFailureKind === "rate-limit") return;
-      post({ type: "YT_TRANSCRIPT_ERROR", message: "YouTube no devolvió datos para esta pista de subtítulos." });
-      return;
-    }
+    try {
+      const tracks = await waitForCurrentVideoTracks(generation);
+      if (generation !== requestGeneration || !enabled) return;
+      if (transcriptCompleted && lastReadyPayload?.videoId === currentVideoId) return;
+      const selected = preferredTrack(tracks);
+      if (selected) {
+        if (restoreCachedTranscript(selected.id)) return;
+        const loaded = await loadTrackDirectly(selected, generation);
+        if (loaded) return;
+        if (generation !== requestGeneration || lastFailureKind === "rate-limit") return;
+        post({ type: "YT_TRANSCRIPT_ERROR", message: "YouTube no devolvió datos para esta pista de subtítulos." });
+        return;
+      }
 
-    post({ type: "YT_TRANSCRIPT_UNAVAILABLE", videoId: currentVideoId });
+      post({ type: "YT_TRANSCRIPT_UNAVAILABLE", videoId: currentVideoId });
+    } finally {
+      if (generation === requestGeneration) requestInFlight = false;
+    }
   }
 
   window.addEventListener("message", (event) => {

@@ -26,7 +26,8 @@
         state.transcript = event.data;
         state.transcriptTracks = Array.isArray(event.data.tracks) ? event.data.tracks : state.transcriptTracks;
         state.autoScrollEnabled = true;
-        ytx.notes.loadCurrent().then(() => ytx.renderer.renderCurrentMode());
+        ytx.renderer.renderCurrentMode();
+        ytx.notes.loadCurrent();
         ytx.panel.updateTrackSelector?.();
         break;
       case "YT_TRANSCRIPT_TRACKS":
