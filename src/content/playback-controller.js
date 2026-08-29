@@ -13,6 +13,7 @@
   let suppressNextAutomaticRewind = false;
   let heldShortcut = null;
   let retryTimer = null;
+  let lastAppliedRate = null;
   const pauseRewind = { enabled: false, seconds: 2, mode: "fixed" };
 
   function validRate(value) {
@@ -32,6 +33,7 @@
   function applyRate(rate, temporary = false) {
     const video = document.querySelector("video");
     if (!video) return false;
+    lastAppliedRate = rate;
     video.playbackRate = rate;
     broadcastRate(rate, temporary);
     return true;
@@ -214,6 +216,19 @@
     if (!extensionEnabled) return;
     setPreferredRate(event.data.rate, true);
   });
+
+  function onRateChange(event) {
+    if (!extensionEnabled || heldShortcut) return;
+    const video = event.target;
+    if (!(video instanceof HTMLVideoElement)) return;
+    const rate = validRate(video.playbackRate);
+    if (!rate) return;
+    if (lastAppliedRate != null && Math.abs(rate - lastAppliedRate) < 0.001) return;
+    lastAppliedRate = rate;
+    preferredRate = rate;
+    chrome.storage.local.set({ lastSpeed: rate });
+  }
+
   window.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("keyup", onKeyUp, true);
   window.addEventListener("yt-navigate-finish", () => {
@@ -226,6 +241,7 @@
       applyRate(heldShortcut?.speed || preferredRate, Boolean(heldShortcut));
     }
   }, true);
+  document.addEventListener("ratechange", onRateChange, true);
   document.addEventListener("pause", (event) => {
     const video = event.target;
     if (suppressNextAutomaticRewind) {

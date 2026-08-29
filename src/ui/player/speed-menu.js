@@ -142,6 +142,12 @@
     slider.addEventListener("input", () => setRate(slider.value));
     document.addEventListener("click", onDocumentClick, true);
     ["keydown", "keyup", "keypress"].forEach((type) => window.addEventListener(type, blockShortcuts, true));
+    const onLeave = () => close();
+    const onVisibilityChange = () => { if (document.hidden) close(); };
+    window.addEventListener("yt-navigate-finish", onLeave);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("blur", onLeave);
+    window.addEventListener("pagehide", onLeave);
     chrome.storage.local.get({ lastSpeed: 1, rememberPlaybackSpeed: true, speedPresets: DEFAULT_PRESETS }, (stored) => {
       renderPresets(stored.speedPresets);
       setRate(stored.rememberPlaybackSpeed === false ? 1 : (stored.lastSpeed || 1));
@@ -152,6 +158,10 @@
       destroy() {
         document.removeEventListener("click", onDocumentClick, true);
         ["keydown", "keyup", "keypress"].forEach((type) => window.removeEventListener(type, blockShortcuts, true));
+        window.removeEventListener("yt-navigate-finish", onLeave);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        window.removeEventListener("blur", onLeave);
+        window.removeEventListener("pagehide", onLeave);
         element.remove();
       },
     };
