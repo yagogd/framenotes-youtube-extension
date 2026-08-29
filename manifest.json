@@ -68,7 +68,12 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["src/injected/transcript-network.js", "src/transcript/transcript-parser.js"],
+      "resources": [
+        "src/injected/transcript-network.js",
+        "src/injected/transcript-player.js",
+        "src/injected/transcript-sources.js",
+        "src/transcript/transcript-parser.js"
+      ],
       "matches": ["https://www.youtube.com/*"]
     }
   ],

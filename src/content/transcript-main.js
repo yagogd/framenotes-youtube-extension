@@ -136,6 +136,8 @@
       };
       const settingsPromise = new Promise((resolve) => chrome.storage.local.get(initialDefaults, resolve));
       await injectPageScript("src/transcript/transcript-parser.js");
+      await injectPageScript("src/injected/transcript-player.js");
+      await injectPageScript("src/injected/transcript-sources.js");
       await injectPageScript("src/injected/transcript-network.js");
       const stored = await settingsPromise;
       initialStorageChanges.forEach((change, key) => {

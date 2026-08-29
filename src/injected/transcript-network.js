@@ -18,15 +18,14 @@
   let observerActive = false;
   let observerStarted = false;
   const silentObservedUrls = new Set();
-  let captionProbe = null;
-  let ignorePlayerCaptionRequestsUntil = 0;
   let requestInFlight = false;
-  const observedPlayerUrls = new Map();
-  const capturedTimedTextBodies = new Map();
   const pendingObservedFallbacks = new Set();
   const CAPTURE_EVENT = "ytx-timedtext-captured";
-  const MAX_CAPTURED_BODIES = 8;
   let activeRequestedTrack = null;
+  const playerApi = window.YTXTranscriptPlayer;
+  const sourceApi = window.YTXTranscriptSources;
+  if (!playerApi || !sourceApi) throw new Error("Los módulos de transcripción no están disponibles");
+  const timedTextStore = sourceApi.createTimedTextStore(8);
 
   function schedule(callback, delay) {
     const timer = setTimeout(() => {
@@ -37,146 +36,23 @@
     return timer;
   }
 
+  function cancelScheduled(timer) {
+    clearTimeout(timer);
+    pendingTimers.delete(timer);
+  }
+
+  const captionProbe = playerApi.createCaptionProbe({
+    schedule,
+    cancelScheduled,
+    isCurrent: (generation) => enabled && generation === requestGeneration,
+  });
+
   function post(payload) {
     window.postMessage({ source: "YT_TRANSCRIPT_EXTENSION", ...payload }, "*");
   }
 
-  function finishCaptionProbe(success = false) {
-    const probe = captionProbe;
-    if (!probe) return;
-    captionProbe = null;
-    clearTimeout(probe.timeout);
-    pendingTimers.delete(probe.timeout);
-    const player = document.getElementById("movie_player");
-    const button = document.querySelector(".ytp-subtitles-button");
-    ignorePlayerCaptionRequestsUntil = Date.now() + 2500;
-    if (probe.previousTrack) {
-      try { player?.setOption?.("captions", "track", probe.previousTrack); } catch (_) { /* Restauración opcional. */ }
-    }
-    const restore = (attempt = 0) => {
-      const pressed = button?.getAttribute("aria-pressed") === "true";
-      if (button && pressed !== probe.wasEnabled) button.click();
-      const restored = !button || (button.getAttribute("aria-pressed") === "true") === probe.wasEnabled;
-      if (!restored && attempt < 20) {
-        schedule(() => restore(attempt + 1), 100);
-        return;
-      }
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        player?.classList.remove("ytx-caption-probe-active");
-      }));
-    };
-    restore();
-    probe.resolve(success);
-  }
-
-  function requestSignedCaptionUrl(track, generation) {
-    if (!enabled || generation !== requestGeneration || captionProbe) return Promise.resolve(false);
-    const player = document.getElementById("movie_player");
-    const button = document.querySelector(".ytp-subtitles-button");
-    if (!player || !button) return Promise.resolve(false);
-    return new Promise((resolve) => {
-      const wasEnabled = button.getAttribute("aria-pressed") === "true";
-      const previousTrack = player.getOption?.("captions", "track") || null;
-      const sourceCode = track.sourceLanguageCode || track.languageCode;
-      const sourceTrack = playerCaptionTracks().find((candidate) => candidate.languageCode === sourceCode &&
-        (candidate.kind === "asr") === Boolean(track.isTranslated ? track.sourceIsAutomatic : track.isAutomatic)) ||
-        playerCaptionTracks().find((candidate) => candidate.languageCode === sourceCode);
-      const requestedTrack = sourceTrack ? { ...sourceTrack } : { languageCode: sourceCode };
-    if (track.isTranslated) {
-        requestedTrack.translationLanguage = playerTranslationLanguages()
-          .find((language) => language.languageCode === track.languageCode) || { languageCode: track.languageCode };
-      }
-      player.classList.add("ytx-caption-probe-active");
-      const timeout = schedule(() => finishCaptionProbe(false), 8000);
-      captionProbe = { generation, wasEnabled, resolve, timeout, previousTrack, track };
-      try {
-        player.loadModule?.("captions");
-        player.setOption?.("captions", "track", requestedTrack);
-      } catch (_) { /* El clic inferior conserva el mecanismo de respaldo. */ }
-      schedule(() => {
-        if (captionProbe?.generation !== generation) return;
-        if (button.getAttribute("aria-pressed") !== "true") button.click();
-      }, 120);
-    });
-  }
-
-  function captionUrlMatchesTrack(url, track) {
-    const parsed = new URL(url);
-    const translated = parsed.searchParams.get("tlang");
-    const language = parsed.searchParams.get("lang") || "";
-      if (track.isTranslated) {
-      const source = track.sourceLanguageCode || "";
-      const sourceIsAutomatic = parsed.searchParams.get("kind") === "asr";
-      return translated === track.languageCode && sourceIsAutomatic === Boolean(track.sourceIsAutomatic) &&
-        (!source || language === source || language.startsWith(`${source}-`));
-    }
-    const automatic = parsed.searchParams.get("kind") === "asr";
-    return !translated && automatic === Boolean(track.isAutomatic) &&
-      (language === track.languageCode || language.startsWith(`${track.languageCode}-`) ||
-      track.languageCode.startsWith(`${language}-`));
-  }
-
-  function videoIdFromLocation() {
-    return new URL(location.href).searchParams.get("v");
-  }
-
-  function playerCaptionData() {
-    const playerResponse = document.getElementById("movie_player")?.getPlayerResponse?.() || window.ytInitialPlayerResponse;
-    return playerResponse?.captions?.playerCaptionsTracklistRenderer || {};
-  }
-
-  function playerResponseVideoId() {
-    const playerResponse = document.getElementById("movie_player")?.getPlayerResponse?.() || window.ytInitialPlayerResponse;
-    return playerResponse?.videoDetails?.videoId || null;
-  }
-
-  function playerCaptionTracks() {
-    return playerCaptionData().captionTracks || [];
-  }
-
-  function playerTranslationLanguages() {
-    return playerCaptionData().translationLanguages || [];
-  }
-
-  function trackName(track) {
-    return track.name?.simpleText || track.name?.runs?.map((run) => run.text).join("") ||
-      track.languageName?.simpleText || track.languageName?.runs?.map((run) => run.text).join("") ||
-      track.languageCode || "Desconocido";
-  }
-
   function collectTracks() {
-    const originalTracks = playerCaptionTracks().map((track, index) => ({
-      id: `${track.languageCode || "unknown"}:${track.kind || "manual"}:${index}`,
-      languageCode: track.languageCode || "unknown",
-      languageName: trackName(track),
-      isAutomatic: track.kind === "asr",
-      isTranslatable: track.isTranslatable !== false,
-      baseUrl: track.baseUrl,
-    })).filter((track) => {
-      if (!track.baseUrl) return false;
-      const trackVideoId = new URL(track.baseUrl).searchParams.get("v");
-      return !trackVideoId || !currentVideoId || trackVideoId === currentVideoId;
-    });
-    const translatableTracks = originalTracks.filter((track) => track.isTranslatable);
-    const translationSource = translatableTracks.find((track) => !track.isAutomatic) || translatableTracks[0];
-    const originalLanguages = new Set(originalTracks.map((track) => track.languageCode.toLocaleLowerCase()));
-    const translatedTracks = translationSource ? playerTranslationLanguages()
-      .filter((language) => language.languageCode && !originalLanguages.has(language.languageCode.toLocaleLowerCase()))
-      .map((language) => {
-        const url = new URL(translationSource.baseUrl);
-        url.searchParams.set("tlang", language.languageCode);
-        return {
-          id: `translated:${language.languageCode}`,
-          languageCode: language.languageCode,
-          languageName: trackName(language),
-          isAutomatic: true,
-          isTranslated: true,
-          sourceLanguageCode: translationSource.languageCode,
-          sourceIsAutomatic: Boolean(translationSource.isAutomatic),
-          baseUrl: url.href,
-        };
-      }) : [];
-    availableTracks = [...originalTracks, ...translatedTracks];
+    availableTracks = playerApi.collectTracks(currentVideoId);
     post({
       type: "YT_TRANSCRIPT_TRACKS",
       videoId: currentVideoId,
@@ -186,20 +62,21 @@
   }
 
   function preferredTrack(tracks) {
-    if (!tracks.length) return null;
-    if (!preferredLanguage || preferredLanguage === "auto") return tracks[0];
-    const language = preferredLanguage.toLocaleLowerCase();
-    const matches = tracks.filter((track) => {
-      const code = track.languageCode.toLocaleLowerCase();
-      return code === language || code.startsWith(`${language}-`);
-    });
-    return matches.find((track) => !track.isAutomatic) || matches[0] || tracks[0];
+    return playerApi.preferredTrack(tracks, preferredLanguage);
   }
 
-  function json3Url(baseUrl) {
-    const url = new URL(baseUrl);
-    url.searchParams.set("fmt", "json3");
-    return url.href;
+  const captionUrlMatchesTrack = playerApi.captionUrlMatchesTrack;
+  const json3Url = sourceApi.json3Url;
+  const timedTextVideoId = sourceApi.timedTextVideoId;
+  const videoIdFromLocation = playerApi.videoIdFromLocation;
+  const getTrackInformation = playerApi.trackInformation;
+
+  function finishCaptionProbe(success = false) {
+    captionProbe.finish(success);
+  }
+
+  function requestSignedCaptionUrl(track, generation) {
+    return captionProbe.request(track, generation);
   }
 
   function cacheKey(videoId, trackId) {
@@ -214,35 +91,6 @@
     lastReadyPayload = { ...cached, tracks: availableTracks.map(({ baseUrl, ...track }) => track) };
     post(lastReadyPayload);
     return true;
-  }
-
-  function getTrackInformation(url) {
-    const parsedUrl = new URL(url);
-    const translatedLanguage = parsedUrl.searchParams.get("tlang");
-    const languageCode = translatedLanguage || parsedUrl.searchParams.get("lang") || "desconocido";
-    let languageName = languageCode;
-    let isAutomatic = translatedLanguage ? true : parsedUrl.searchParams.get("kind") === "asr";
-    const isTranslated = Boolean(translatedLanguage);
-
-    if (translatedLanguage) {
-      const language = playerTranslationLanguages().find((candidate) => candidate.languageCode === translatedLanguage);
-      if (language) languageName = trackName(language);
-      return { languageCode, languageName, isAutomatic, isTranslated };
-    }
-
-    const tracks = window.ytInitialPlayerResponse?.captions
-      ?.playerCaptionsTracklistRenderer?.captionTracks || [];
-    const urlKind = new URL(url).searchParams.get("kind") || "manual";
-    const track = tracks.find((candidate) => candidate.languageCode === languageCode && (candidate.kind || "manual") === urlKind) ||
-      tracks.find((candidate) => candidate.languageCode === languageCode);
-    if (track) {
-      languageName = track.name?.simpleText ||
-        track.name?.runs?.map((run) => run.text).join("") ||
-        languageCode;
-      isAutomatic = track.kind === "asr";
-    }
-
-    return { languageCode, languageName, isAutomatic, isTranslated };
   }
 
   function completeTimedTextBody(url, text, options = {}) {
@@ -340,10 +188,6 @@
     }
   }
 
-  function timedTextVideoId(url) {
-    try { return new URL(url).searchParams.get("v"); } catch (_) { return null; }
-  }
-
   function capturedBodyMatchesPreference(entry) {
     if (!entry || timedTextVideoId(entry.url) !== currentVideoId) return false;
     const selected = preferredTrack(availableTracks);
@@ -351,23 +195,7 @@
   }
 
   function rememberCapturedTimedText(entry) {
-    if (!entry || typeof entry.url !== "string" || typeof entry.body !== "string") return;
-    if (!entry.body && Number(entry.status) !== 429) return;
-    if (!entry.url.includes("/api/timedtext")) return;
-    const normalized = {
-      url: entry.url,
-      body: entry.body,
-      status: Number(entry.status) || 0,
-      contentType: entry.contentType || "",
-      retryAfter: entry.retryAfter || "",
-      capturedAt: Number(entry.capturedAt) || Date.now(),
-    };
-    capturedTimedTextBodies.delete(normalized.url);
-    capturedTimedTextBodies.set(normalized.url, normalized);
-    while (capturedTimedTextBodies.size > MAX_CAPTURED_BODIES) {
-      capturedTimedTextBodies.delete(capturedTimedTextBodies.keys().next().value);
-    }
-    recordPlayerTimedTextUrl(normalized.url);
+    return timedTextStore.rememberBody(entry);
   }
 
   function processCapturedTimedText(entry, options = {}) {
@@ -378,7 +206,7 @@
       const retryAfter = Number(entry.retryAfter);
       rateLimitedUntil = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30000);
       lastFailureKind = "rate-limit";
-      const shouldNotify = !transcriptCompleted && (requestInFlight || activeRequestedTrack || captionProbe);
+      const shouldNotify = !transcriptCompleted && (requestInFlight || activeRequestedTrack || captionProbe.active);
       if (shouldNotify && !entry.rateLimitNotified) {
         entry.rateLimitNotified = true;
         post({
@@ -405,11 +233,9 @@
   }
 
   function findCapturedTimedText(track = null) {
-    const entries = Array.from(capturedTimedTextBodies.values()).reverse();
-    return entries.find((entry) => {
-      if (entry.invalid || timedTextVideoId(entry.url) !== currentVideoId) return false;
-      return track ? captionUrlMatchesTrack(entry.url, track) : capturedBodyMatchesPreference(entry);
-    }) || null;
+    return timedTextStore.findBody(currentVideoId, (entry) =>
+      track ? captionUrlMatchesTrack(entry.url, track) : capturedBodyMatchesPreference(entry)
+    );
   }
 
   function tryCapturedTimedText(generation, track = null) {
@@ -418,17 +244,11 @@
   }
 
   function matchingObservedTimedTextUrl() {
-    const urls = Array.from(observedPlayerUrls.values()).reverse();
-    return urls.find((url) => capturedBodyMatchesPreference({ url })) || null;
+    return timedTextStore.findObserved(currentVideoId, (url) => capturedBodyMatchesPreference({ url }));
   }
 
   function pruneTimedTextData(videoId) {
-    for (const [key, url] of observedPlayerUrls) {
-      if (timedTextVideoId(url) !== videoId) observedPlayerUrls.delete(key);
-    }
-    for (const [url] of capturedTimedTextBodies) {
-      if (timedTextVideoId(url) !== videoId) capturedTimedTextBodies.delete(url);
-    }
+    timedTextStore.prune(videoId);
   }
 
   function handleCapturedTimedText(entry) {
@@ -436,19 +256,19 @@
     rememberCapturedTimedText(entry);
     if (!enabled || transcriptCompleted) return;
     if (timedTextVideoId(entry.url) !== currentVideoId) return;
-    const probe = captionProbe;
+    const probe = captionProbe.active;
     const requestedTrack = probe?.track || activeRequestedTrack;
     if (requestedTrack) {
       if (captionUrlMatchesTrack(entry.url, requestedTrack)) {
-        const loaded = processCapturedTimedText(capturedTimedTextBodies.get(entry.url), {
+        const loaded = processCapturedTimedText(timedTextStore.getBody(entry.url), {
           generation: probe?.generation ?? requestGeneration,
           selectedTrackId: requestedTrack.id,
         });
-        if (probe && loaded && captionProbe === probe) finishCaptionProbe(true);
+        if (probe && loaded && captionProbe.active === probe) finishCaptionProbe(true);
       }
       return;
     }
-    if (capturedBodyMatchesPreference(entry)) processCapturedTimedText(capturedTimedTextBodies.get(entry.url));
+    if (capturedBodyMatchesPreference(entry)) processCapturedTimedText(timedTextStore.getBody(entry.url));
   }
 
   window.addEventListener(CAPTURE_EVENT, (event) => handleCapturedTimedText(event.detail));
@@ -456,38 +276,27 @@
     .forEach((entry) => rememberCapturedTimedText(entry));
 
   function recordPlayerTimedTextUrl(url) {
-    try {
-      const parsed = new URL(url);
-      const v = parsed.searchParams.get("v") || currentVideoId || "";
-      const lang = parsed.searchParams.get("lang") || "";
-      const tlang = parsed.searchParams.get("tlang") || "";
-      if (v) observedPlayerUrls.set(`${v}:${lang}:${tlang}`, url);
-    } catch (_) { /* URL inválida; se ignora. */ }
+    timedTextStore.recordUrl(url, currentVideoId);
   }
 
   function matchingPlayerTimedTextUrl(track) {
     if (!currentVideoId || !track) return null;
-    const prefix = `${currentVideoId}:`;
-    for (const [key, url] of observedPlayerUrls) {
-      if (!key.startsWith(prefix)) continue;
-      if (captionUrlMatchesTrack(url, track)) return url;
-    }
-    return null;
+    return timedTextStore.findObserved(currentVideoId, (url) => captionUrlMatchesTrack(url, track));
   }
 
   function processObservedTimedText(name, probe = null) {
-    const captured = capturedTimedTextBodies.get(name);
+    const captured = timedTextStore.getBody(name);
     if (captured) {
       const loaded = processCapturedTimedText(captured, probe ? {
         generation: probe.generation,
         selectedTrackId: probe.track.id,
       } : {});
       if (loaded) {
-        if (probe && captionProbe === probe) finishCaptionProbe(true);
+        if (probe && captionProbe.active === probe) finishCaptionProbe(true);
         return;
       }
       if (captured.status === 429) {
-        if (probe && captionProbe === probe) finishCaptionProbe(false);
+        if (probe && captionProbe.active === probe) finishCaptionProbe(false);
         return;
       }
     }
@@ -497,7 +306,7 @@
       generation: probe.generation,
       ignoreRateLimit: true,
     } : {}).then((loaded) => {
-      if (probe && captionProbe === probe) finishCaptionProbe(loaded);
+      if (probe && captionProbe.active === probe) finishCaptionProbe(loaded);
     });
   }
 
@@ -507,12 +316,12 @@
       return;
     }
     recordPlayerTimedTextUrl(name);
-    if (!captionProbe && Date.now() < ignorePlayerCaptionRequestsUntil) return;
-    const probe = captionProbe;
+    if (captionProbe.shouldIgnorePlayerRequests()) return;
+    const probe = captionProbe.active;
     const requestedTrack = probe?.track || activeRequestedTrack;
     if (requestedTrack && !captionUrlMatchesTrack(name, requestedTrack)) return;
     if (!requestedTrack && !capturedBodyMatchesPreference({ url: name })) return;
-    if (capturedTimedTextBodies.has(name) || !window.__ytxTimedTextCaptureInstalled) {
+    if (timedTextStore.hasBody(name) || !window.__ytxTimedTextCaptureInstalled) {
       processObservedTimedText(name, probe);
       return;
     }
@@ -521,7 +330,7 @@
     schedule(() => {
       pendingObservedFallbacks.delete(name);
       if (!enabled || transcriptCompleted) return;
-      processObservedTimedText(name, probe && captionProbe === probe ? probe : null);
+      processObservedTimedText(name, probe && captionProbe.active === probe ? probe : null);
     }, 100);
   }
 
@@ -553,7 +362,7 @@
     activeRequestedTrack = null;
     activeFetchController?.abort();
     activeFetchController = null;
-    if (captionProbe) finishCaptionProbe(false);
+    captionProbe.cancel();
     pendingTimers.forEach((timer) => clearTimeout(timer));
     pendingTimers.clear();
     silentObservedUrls.clear();
@@ -563,174 +372,50 @@
   }
 
   async function waitForCurrentVideoTracks(generation, timeoutMs = 10000) {
-    const deadline = Date.now() + timeoutMs;
-    const player = document.getElementById("movie_player");
-
-    return new Promise((resolve) => {
-      let settled = false;
-      let pollTimer = null;
-
-      const cleanup = () => {
-        player?.removeEventListener?.("onApiChange", tryResolve);
-        player?.removeEventListener?.("onReady", tryResolve);
-        document.removeEventListener("yt-player-updated", tryResolve);
-        window.removeEventListener("ytx-transcript-ready-internal", tryResolve);
-        if (pollTimer) clearTimeout(pollTimer);
-      };
-
-      const tryResolve = () => {
-        if (settled || !enabled || generation !== requestGeneration) return;
-        const responseVideoId = playerResponseVideoId();
-        const tracks = playerCaptionTracks();
-        if ((!responseVideoId || responseVideoId === currentVideoId) && tracks.length) {
-          settled = true;
-          cleanup();
-          resolve(collectTracks());
-        }
-      };
-
-      player?.addEventListener?.("onApiChange", tryResolve);
-      player?.addEventListener?.("onReady", tryResolve);
-      document.addEventListener("yt-player-updated", tryResolve);
-      window.addEventListener("ytx-transcript-ready-internal", tryResolve);
-
-      const poll = () => {
-        if (settled || !enabled || generation !== requestGeneration) {
-          cleanup();
-          resolve([]);
-          return;
-        }
-        tryResolve();
-        if (!settled) {
-          if (Date.now() >= deadline) {
-            cleanup();
-            resolve([]);
-          } else {
-            pollTimer = schedule(poll, 250);
-          }
-        }
-      };
-
-      tryResolve();
-      pollTimer = schedule(poll, 250);
+    const tracks = await playerApi.waitForTracks({
+      currentVideoId,
+      generation,
+      timeoutMs,
+      isCurrent: (candidateGeneration) => enabled && candidateGeneration === requestGeneration,
+      schedule,
+      cancelScheduled,
     });
-  }
-
-  function transcriptParams(videoId, languageCode) {
-    const encoder = new TextEncoder();
-    const field = (number, value) => {
-      const bytes = encoder.encode(value);
-      return [(number << 3) | 2, bytes.length, ...bytes];
-    };
-    const language = field(1, languageCode || "");
-    const payload = [...field(1, videoId), (2 << 3) | 2, language.length, ...language];
-    return btoa(String.fromCharCode(...payload));
-  }
-
-  function findTranscriptEndpointParams(root) {
-    const seen = new WeakSet();
-    const stack = [root];
-    let inspected = 0;
-    while (stack.length && inspected < 100000) {
-      const value = stack.pop();
-      if (!value || typeof value !== "object" || seen.has(value)) continue;
-      seen.add(value);
-      inspected += 1;
-      const params = value.getTranscriptEndpoint?.params;
-      if (typeof params === "string" && params) return params;
-      if (Array.isArray(value)) stack.push(...value);
-      else Object.values(value).forEach((child) => {
-        if (child && typeof child === "object") stack.push(child);
-      });
-    }
-    return null;
-  }
-
-  function currentTranscriptEndpointParams() {
-    const roots = [
-      document.querySelector("ytd-watch-flexy")?.data,
-      document.querySelector("ytd-app")?.data,
-      window.ytInitialData,
-    ];
-    for (const root of roots) {
-      const params = findTranscriptEndpointParams(root);
-      if (params) return params;
-    }
-    return null;
-  }
-
-  function collectTranscriptCues(value, cues = []) {
-    if (!value || typeof value !== "object") return cues;
-    const renderer = value.transcriptCueRenderer;
-    if (renderer) {
-      const text = renderer.cue?.simpleText || renderer.cue?.runs?.map((run) => run.text).join("") || "";
-      const startMs = Number(renderer.startOffsetMs) || 0;
-      const durationMs = Number(renderer.durationMs) || 0;
-      if (text) cues.push({ tStartMs: startMs, dDurationMs: durationMs, segs: [{ utf8: text }] });
-    }
-    Object.values(value).forEach((child) => collectTranscriptCues(child, cues));
-    return cues;
+    if (!tracks.length) return [];
+    availableTracks = tracks;
+    post({
+      type: "YT_TRANSCRIPT_TRACKS",
+      videoId: currentVideoId,
+      tracks: availableTracks.map(({ baseUrl, ...track }) => track),
+    });
+    return availableTracks;
   }
 
   async function loadTrackFromTranscriptApi(track, generation) {
-    const apiKey = window.ytcfg?.get?.("INNERTUBE_API_KEY");
-    const context = window.ytcfg?.get?.("INNERTUBE_CONTEXT");
-    if (!apiKey || !context || !currentVideoId || generation !== requestGeneration) return false;
-    let realParams = currentTranscriptEndpointParams();
-    for (let attempt = 0; !realParams && attempt < 8; attempt += 1) {
-      await new Promise((resolve) => schedule(resolve, 250));
-      if (!enabled || generation !== requestGeneration) return false;
-      realParams = currentTranscriptEndpointParams();
-    }
-    const candidates = [...new Set([
-      realParams,
-      transcriptParams(currentVideoId, track.languageCode),
-    ].filter(Boolean))];
-    try {
-      let parsedTranscript = null;
-      for (const params of candidates) {
-        const response = await fetch(`/youtubei/v1/get_transcript?key=${encodeURIComponent(apiKey)}&prettyPrint=false`, {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "Content-Type": "application/json",
-            "X-YouTube-Client-Name": String(window.ytcfg?.get?.("INNERTUBE_CONTEXT_CLIENT_NAME") || 1),
-            "X-YouTube-Client-Version": String(context.client?.clientVersion || ""),
-          },
-          body: JSON.stringify({ context, params }),
-        });
-        if (!response.ok) continue;
-        const data = await response.json();
-        const events = collectTranscriptCues(data);
-        const result = window.YTXTranscriptParser.parseJson3({ events });
-        if (result.cues.length) {
-          parsedTranscript = result;
-          break;
-        }
-      }
-      if (!parsedTranscript || generation !== requestGeneration) return false;
-      const { cues, blocks } = parsedTranscript;
-      transcriptCompleted = true;
-      lastReadyPayload = {
-        type: "YT_TRANSCRIPT_READY",
-        videoId: currentVideoId,
-        cues,
-        blocks,
-        languageCode: track.languageCode,
-        languageName: track.languageName,
-        isAutomatic: Boolean(track.isAutomatic),
-        isTranslated: Boolean(track.isTranslated),
-        selectedTrackId: track.id,
-        tracks: availableTracks.map(({ baseUrl, ...availableTrack }) => availableTrack),
-      };
-      const key = cacheKey(currentVideoId, track.id);
-      if (key) transcriptCache.set(key, lastReadyPayload);
-      post(lastReadyPayload);
-      return true;
-    } catch (error) {
-      console.debug("[Transcript] El endpoint alternativo no devolvió una transcripción:", error);
-      return false;
-    }
+    const result = await sourceApi.loadTranscriptApi({
+      track,
+      videoId: currentVideoId,
+      generation,
+      isCurrent: (candidateGeneration) => enabled && candidateGeneration === requestGeneration,
+      schedule,
+    });
+    if (!result || generation !== requestGeneration) return false;
+    transcriptCompleted = true;
+    lastReadyPayload = {
+      type: "YT_TRANSCRIPT_READY",
+      videoId: currentVideoId,
+      cues: result.cues,
+      blocks: result.blocks,
+      languageCode: track.languageCode,
+      languageName: track.languageName,
+      isAutomatic: Boolean(track.isAutomatic),
+      isTranslated: Boolean(track.isTranslated),
+      selectedTrackId: track.id,
+      tracks: availableTracks.map(({ baseUrl, ...availableTrack }) => availableTrack),
+    };
+    const key = cacheKey(currentVideoId, track.id);
+    if (key) transcriptCache.set(key, lastReadyPayload);
+    post(lastReadyPayload);
+    return true;
   }
 
   async function loadTrackDirectly(track, generation) {
