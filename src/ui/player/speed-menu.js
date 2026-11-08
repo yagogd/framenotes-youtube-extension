@@ -92,6 +92,7 @@
     function close() {
       element.hidden = true;
       button.setAttribute("aria-expanded", "false");
+      player.classList.remove("ytx-speed-menu-open");
     }
 
     function raiseAboveNotesOverlays() {
@@ -109,6 +110,7 @@
       const opening = element.hidden;
       element.hidden = !opening;
       button.setAttribute("aria-expanded", String(!element.hidden));
+      player.classList.toggle("ytx-speed-menu-open", opening);
       if (opening) {
         raiseAboveNotesOverlays();
         chrome.storage.local.get({ speedPresets: DEFAULT_PRESETS }, (stored) => renderPresets(stored.speedPresets));
@@ -162,6 +164,7 @@
         document.removeEventListener("visibilitychange", onVisibilityChange);
         window.removeEventListener("blur", onLeave);
         window.removeEventListener("pagehide", onLeave);
+        player.classList.remove("ytx-speed-menu-open");
         element.remove();
       },
     };
