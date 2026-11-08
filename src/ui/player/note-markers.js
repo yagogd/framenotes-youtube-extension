@@ -58,9 +58,10 @@
 
     function handlePointerMove(event) {
       const player = getUi()?.player;
+      const progressBar = player?.querySelector(".ytp-progress-bar");
       const progressList = player?.querySelector(".ytp-progress-list");
       const preview = player?.querySelector(":scope > .ytx-progress-marker-preview");
-      if (!player || !progressList || !preview) return;
+      if (!player || !progressBar || !progressList || !preview) return;
       const progressRect = progressList.getBoundingClientRect();
       const previewRect = preview.hidden ? null : preview.getBoundingClientRect();
       const insidePath = previewRect && event.clientX >= previewRect.left - 12 && event.clientX <= previewRect.right + 12 &&
@@ -75,7 +76,7 @@
       }
       let closest = null;
       let closestDistance = Infinity;
-      progressList.querySelectorAll(".ytx-progress-marker").forEach((marker) => {
+      progressBar.querySelectorAll(".ytx-progress-marker").forEach((marker) => {
         const rect = marker.getBoundingClientRect();
         const distance = event.clientX < rect.left ? rect.left - event.clientX : event.clientX > rect.right ? event.clientX - rect.right : 0;
         if (distance < closestDistance) { closest = marker; closestDistance = distance; }
@@ -90,20 +91,20 @@
     }
 
     function refresh() {
-      const progressList = document.querySelector(".html5-video-player .ytp-progress-list");
+      const player = document.querySelector(".html5-video-player");
+      const progressBar = player?.querySelector(".ytp-progress-bar");
       const video = document.querySelector("video");
-      if (!progressList || !video || !Number.isFinite(video.duration) || video.duration <= 0) return;
-      const player = progressList.closest(".html5-video-player");
-      if (!player) return;
+      if (!player || !progressBar || !video || !Number.isFinite(video.duration) || video.duration <= 0) return;
       const preview = getPreview(player);
       preview.hidden = true;
-      let layer = progressList.querySelector(":scope > .ytx-progress-markers");
+      let layer = progressBar.querySelector(":scope > .ytx-progress-markers");
       if (!layer) {
         layer = document.createElement("div");
         layer.className = "ytx-progress-markers";
-        progressList.appendChild(layer);
+        progressBar.appendChild(layer);
       }
-      layer.style.setProperty("--ytx-marker-bar-height", `${Math.max(2, Math.round(progressList.getBoundingClientRect().height))}px`);
+      const barLine = progressBar.querySelector(".ytp-progress-list") || progressBar;
+      layer.style.setProperty("--ytx-marker-bar-height", `${Math.max(2, Math.round(barLine.getBoundingClientRect().height))}px`);
       layer.replaceChildren();
       (ytx.state.savedNotes || []).forEach((item) => {
         const startSeconds = Math.max(0, Number(item.startMs) / 1000 || 0);

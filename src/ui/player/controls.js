@@ -154,7 +154,7 @@
     if (!player || !rightControls) return;
     if (currentUi?.group?.isConnected && currentUi.player === player) {
       updateTranscriptButton();
-      if (!document.querySelector(".html5-video-player .ytp-progress-list > .ytx-progress-markers")) noteMarkers.refresh();
+      if (!document.querySelector(".html5-video-player .ytp-progress-bar > .ytx-progress-markers")) noteMarkers.refresh();
       return;
     }
     remove();
