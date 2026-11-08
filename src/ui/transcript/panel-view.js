@@ -247,9 +247,9 @@
     notesWorkspaceHeader.append(notesWorkspaceTitle, notesWorkspaceClose);
     const notesBody = document.createElement("div");
     notesBody.className = "ytx-video-notes-window__body";
-    notesBody.append(videoNote, organization, notesDrawer);
+    notesBody.append(videoNote, organization, noteEditor, notesDrawer);
     notesWorkspace.replaceChildren(notesWorkspaceHeader, notesBody);
-    panel.append(header, searchBar, noteEditor, content);
+    panel.append(header, searchBar, content);
     const mountRoot = document.fullscreenElement || document.body;
     mountRoot.appendChild(panel);
     (document.querySelector(".html5-video-player") || mountRoot).appendChild(notesWorkspace);

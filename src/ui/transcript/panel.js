@@ -109,8 +109,14 @@
     };
   }
 
+  function overlayHost() {
+    const ui = state.ui;
+    if (!ui) return null;
+    return ui.panel.classList.contains("ytx-panel--notes-host-only") ? ui.notesWorkspace : ui.panel;
+  }
+
   function showNotice(message) {
-    const panel = state.ui?.panel;
+    const panel = overlayHost();
     if (!panel) return;
     panel.querySelector(".ytx-notice")?.remove();
     const notice = document.createElement("div");
@@ -133,7 +139,7 @@
   }
 
   function confirmAction(message) {
-    const panel = state.ui?.panel;
+    const panel = overlayHost();
     if (!panel) return Promise.resolve(false);
     panel.querySelector(".ytx-notice")?.remove();
     return new Promise((resolve) => {

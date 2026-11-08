@@ -345,7 +345,7 @@
     ui.noteEditorText.textContent = draft.text || "Marcador sin texto";
     ui.noteEditorInput.value = draft.note || "";
     ui.noteEditorTags.value = (draft.tags || []).join(", ");
-    ui.panel.classList.add("ytx-panel--note-editor-open");
+    ui.notesWorkspace.classList.add("ytx-panel--note-editor-open");
     ui.noteEditorInput.focus();
   }
 
@@ -577,7 +577,7 @@
     const onHeaderNotesClick = (event) => { if (event.target.closest(".ytx-notes__close")) return; toggleSection("ytx-panel--notes-open"); };
     const onCancel = () => {
       editorDraft = null;
-      ui.panel.classList.remove("ytx-panel--note-editor-open");
+      ui.notesWorkspace.classList.remove("ytx-panel--note-editor-open");
       editorReturnFocus?.focus();
       editorReturnFocus = null;
     };
@@ -589,7 +589,7 @@
       onCancel();
     };
     const onEditorKeyDown = (event) => {
-      if (event.key !== "Escape" || !ui.panel.classList.contains("ytx-panel--note-editor-open")) return;
+      if (event.key !== "Escape" || !ui.notesWorkspace.classList.contains("ytx-panel--note-editor-open")) return;
       event.preventDefault();
       event.stopPropagation();
       onCancel();
@@ -681,7 +681,7 @@
     ui.noteEditorTags.addEventListener("focus", onNoteTagFocus);
     ui.noteEditorTags.addEventListener("input", renderNoteEditorTagCatalog);
     ui.noteEditorTags.addEventListener("blur", hideCatalog);
-    ui.panel.addEventListener("keydown", onEditorKeyDown);
+    ui.notesWorkspace.addEventListener("keydown", onEditorKeyDown);
     const stopKey = (event) => event.stopPropagation();
     ui.generalNote.addEventListener("input", onGeneralInput);
     ui.generalNote.addEventListener("keydown", onGeneralKeyDown);
@@ -725,7 +725,7 @@
       ui.noteEditorTags.removeEventListener("focus", onNoteTagFocus);
       ui.noteEditorTags.removeEventListener("input", renderNoteEditorTagCatalog);
       ui.noteEditorTags.removeEventListener("blur", hideCatalog);
-      ui.panel.removeEventListener("keydown", onEditorKeyDown);
+      ui.notesWorkspace.removeEventListener("keydown", onEditorKeyDown);
       ui.generalNote.removeEventListener("input", onGeneralInput);
       ui.generalNote.removeEventListener("keydown", onGeneralKeyDown);
       ui.generalNote.removeEventListener("keyup", stopKey);
